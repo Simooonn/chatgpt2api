@@ -92,7 +92,7 @@
   </dialog>
 
   <!-- 版本更新 -->
-  <dialog class="modal" x-data x-effect="$store.app.releasesOpen ? $el.showModal() : $el.close()" @close="$store.app.releasesOpen = false">
+  <dialog class="modal" x-data x-effect="$store.app.releasesOpen ? $el.showModal() : $el.close()" @close="$store.app.closeReleases()">
     <div class="modal-box modal-md">
       <div class="row row-between modal-title">
         <span>版本更新</span>
@@ -100,25 +100,96 @@
       </div>
       <div x-show="$store.app.checking" class="center-fill"><span class="loading loading-spinner loading-sm"></span></div>
       <div class="vstack vstack-lg" x-show="!$store.app.checking">
-        <template x-for="release in $store.app.releases" :key="release.version">
-          <section class="vstack vstack-sm">
+        <!-- 在线升级与回滚（仅管理员可见） -->
+        <section class="panel vstack vstack-sm" x-show="$store.app.admin">
+          <div class="row row-between">
             <div class="row">
-              <span class="title-section num" x-text="release.version === 'Unreleased' ? '未发布' : 'v' + release.version"></span>
-              <span class="badge badge-sm badge-soft" x-show="release.version === $store.app.version">当前</span>
-              <span class="spacer"></span>
-              <span class="text-xs text-subtle num" x-text="release.date"></span>
+              <span class="title-section">在线升级与回滚</span>
+              <span class="badge badge-sm badge-soft"
+                    :class="$store.app.upgradeStatus?.agent_online ? 'badge-success' : ''"
+                    x-text="!$store.app.upgradeStatus ? '检测中' : ($store.app.upgradeStatus.agent_online ? '代理在线' : ($store.app.upgradeStatus.enabled ? '代理离线' : '未启用'))"></span>
             </div>
-            <template x-for="item in release.items">
-              <div class="row row-start">
-                <span class="badge badge-sm badge-soft shrink-0" :class="{ 'badge-success': item.type === '新增', 'badge-info': item.type === '修复' }" x-text="item.type"></span>
-                <div class="markdown text-muted" x-html="$md(item.content)"></div>
-              </div>
+            <button type="button" class="btn btn-ghost btn-sm" :disabled="$store.app.refreshingReleases" @click="$store.app.refreshReleases(true)">
+              <span x-show="$store.app.refreshingReleases" class="loading loading-spinner loading-xs"></span>
+              刷新
+            </button>
+          </div>
+          <div class="row" x-show="$store.app.forkReleases.length > 0">
+            <select class="select select-sm flex-1" x-model="$store.app.selectedTag" :disabled="$store.app.upgradeBusy">
+              <template x-for="item in $store.app.forkReleases" :key="item.tag">
+                <option :value="item.tag" x-text="item.tag + (item.version === $store.app.version ? '（当前）' : '')"></option>
+              </template>
+            </select>
+            <button type="button" class="btn btn-sm"
+                    :class="$store.app.isUpgradeTarget ? 'btn-primary' : ''"
+                    :disabled="!$store.app.canTriggerUpgrade"
+                    @click="$store.app.triggerUpgrade()">
+              <span x-show="$store.app.submittingUpgrade" class="loading loading-spinner loading-xs"></span>
+              <span x-text="$store.app.isUpgradeTarget ? '一键升级' : '切换到此版本'"></span>
+            </button>
+          </div>
+          <p class="text-xs text-muted" x-show="$store.app.forkReleases.length === 0">暂无已发布的 fork 版本（vX.Y.Z-roamai.N）。</p>
+          <div class="alert alert-soft alert-warning text-xs" x-show="$store.app.reconnecting">
+            <span class="loading loading-spinner loading-xs"></span>
+            <span>容器正在重启，等待服务重新连接…</span>
+          </div>
+          <div class="alert alert-soft text-xs"
+               x-show="!$store.app.reconnecting && $store.app.upgradeStatus?.operation"
+               :class="{
+                 'alert-success': $store.app.upgradeStatus?.operation?.phase === 'succeeded',
+                 'alert-error': $store.app.upgradeStatus?.operation?.phase === 'failed',
+                 'alert-info': $store.app.upgradeStatus?.operation && !['succeeded', 'failed'].includes($store.app.upgradeStatus.operation.phase),
+               }">
+            <span x-show="$store.app.upgradeStatus?.operation && !['succeeded', 'failed'].includes($store.app.upgradeStatus.operation.phase)" class="loading loading-spinner loading-xs"></span>
+            <div class="vstack vstack-xs">
+              <strong x-text="($store.app.upgradeStatus?.operation?.tag || '') + ' · ' + $store.app.phaseLabel($store.app.upgradeStatus?.operation?.phase)"></strong>
+              <span x-text="$store.app.upgradeStatus?.operation?.message"></span>
+              <span class="text-subtle num" x-show="$store.app.upgradeStatus?.operation?.updated_at" x-text="$time($store.app.upgradeStatus?.operation?.updated_at)"></span>
+            </div>
+          </div>
+        </section>
+
+        <!-- Fork Releases 列表 -->
+        <template x-if="$store.app.forkReleases.length > 0">
+          <div class="vstack vstack-lg">
+            <template x-for="release in $store.app.forkReleases" :key="release.tag">
+              <section class="vstack vstack-sm">
+                <div class="row">
+                  <span class="title-section num" x-text="release.tag"></span>
+                  <span class="badge badge-sm badge-soft" x-show="release.version === $store.app.version">当前</span>
+                  <span class="spacer"></span>
+                  <span class="text-xs text-subtle num" x-text="release.published_at ? $short(release.published_at) : ''"></span>
+                </div>
+                <div class="markdown text-muted" x-show="release.notes" x-html="$md(release.notes)"></div>
+              </section>
             </template>
-          </section>
+          </div>
+        </template>
+
+        <!-- 回退展示上游 Changelog -->
+        <template x-if="$store.app.forkReleases.length === 0">
+          <div class="vstack vstack-lg">
+            <template x-for="release in $store.app.releases" :key="release.version">
+              <section class="vstack vstack-sm">
+                <div class="row">
+                  <span class="title-section num" x-text="release.version === 'Unreleased' ? '未发布' : 'v' + release.version"></span>
+                  <span class="badge badge-sm badge-soft" x-show="release.version === $store.app.version">当前</span>
+                  <span class="spacer"></span>
+                  <span class="text-xs text-subtle num" x-text="release.date"></span>
+                </div>
+                <template x-for="item in release.items">
+                  <div class="row row-start">
+                    <span class="badge badge-sm badge-soft shrink-0" :class="{ 'badge-success': item.type === '新增', 'badge-info': item.type === '修复' }" x-text="item.type"></span>
+                    <div class="markdown text-muted" x-html="$md(item.content)"></div>
+                  </div>
+                </template>
+              </section>
+            </template>
+          </div>
         </template>
       </div>
       <div class="modal-action">
-        <a class="btn btn-sm" :class="$store.app.hasUpdate ? 'btn-primary' : ''" href="https://github.com/basketikun/chatgpt2api" target="_blank" rel="noreferrer">前往 GitHub<ui-icon name="external-link" class="icon-sm"></ui-icon></a>
+        <a class="btn btn-sm" :class="$store.app.hasUpdate ? 'btn-primary' : ''" :href="$store.app.releasesUrl" target="_blank" rel="noreferrer">前往 GitHub<ui-icon name="external-link" class="icon-sm"></ui-icon></a>
       </div>
     </div>
     <form method="dialog" class="modal-backdrop"><button>关闭</button></form>

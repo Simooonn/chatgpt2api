@@ -34,6 +34,9 @@ type Config struct {
 	mu             sync.RWMutex
 }
 
+// BuildVersion may be injected at build time via -ldflags -X.
+var BuildVersion string
+
 // 未配置对外生图模型名称时使用的名称
 const defaultImageModelName = "gpt-image-2.6"
 
@@ -131,6 +134,12 @@ func Load(path string) (*Config, error) {
 	}
 	if data, err := os.ReadFile("VERSION"); err == nil && strings.TrimSpace(string(data)) != "" {
 		cfg.Version = strings.TrimSpace(string(data))
+	}
+	if value := strings.TrimPrefix(strings.TrimSpace(BuildVersion), "v"); value != "" {
+		cfg.Version = value
+	}
+	if value := strings.TrimPrefix(strings.TrimSpace(os.Getenv("CHATGPT2API_VERSION")), "v"); value != "" {
+		cfg.Version = value
 	}
 	if cfg.APIKey == "" {
 		return nil, errors.New("请先在 config.yaml 或 CHATGPT2API_AUTH_KEY 中设置管理员密钥")

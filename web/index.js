@@ -1973,6 +1973,52 @@ function parseChangelog(content) {
   }).filter((release) => release.items.length);
 }
 
+function parseVersionParts(raw) {
+  const cleaned = String(raw || "").trim().replace(/^v/, "").split("+")[0];
+  let base = cleaned;
+  let forkRev = 0;
+  const marker = "-roamai.";
+  const idx = cleaned.lastIndexOf(marker);
+  if (idx > 0) {
+    const rev = Number(cleaned.slice(idx + marker.length));
+    if (Number.isInteger(rev) && rev > 0) {
+      base = cleaned.slice(0, idx);
+      forkRev = rev;
+    }
+  }
+  const [core, prerelease = ""] = base.split("-", 2);
+  const nums = core.split(".").map(Number);
+  if (nums.length !== 3 || nums.some((n) => !Number.isInteger(n) || n < 0)) return null;
+  return { nums, prerelease, forkRev };
+}
+
+function compareVersions(leftRaw, rightRaw) {
+  const left = parseVersionParts(leftRaw);
+  const right = parseVersionParts(rightRaw);
+  if (!left || !right) return 0;
+  for (let i = 0; i < 3; i++) {
+    if (left.nums[i] !== right.nums[i]) return left.nums[i] > right.nums[i] ? 1 : -1;
+  }
+  if (left.prerelease !== right.prerelease) {
+    if (!left.prerelease) return 1;
+    if (!right.prerelease) return -1;
+    return left.prerelease > right.prerelease ? 1 : -1;
+  }
+  if (left.forkRev !== right.forkRev) return left.forkRev > right.forkRev ? 1 : -1;
+  return 0;
+}
+
+const UPGRADE_PHASE_LABELS = {
+  queued: "排队中",
+  backing_up: "备份数据库",
+  pulling: "拉取镜像",
+  recreating: "重建容器",
+  health_check: "健康检查",
+  rolling_back: "自动回滚中",
+  succeeded: "已完成",
+  failed: "执行失败",
+};
+
 Alpine.store("app", {
   session: session.get(),
   path: "",
@@ -1981,8 +2027,16 @@ Alpine.store("app", {
   version: "",
   latest: "",
   releases: [],
+  forkReleases: [],
+  upgradeStatus: null,
+  selectedTag: "",
   releasesOpen: false,
   checking: false,
+  refreshingReleases: false,
+  submittingUpgrade: false,
+  trackingOpId: "",
+  reconnecting: false,
+  pollTimer: null,
   get admin() {
     return this.session?.role === ADMIN;
   },
@@ -1992,20 +2046,136 @@ Alpine.store("app", {
   get navItems() {
     return adminNav;
   },
+  get releasesUrl() {
+    const repo = this.upgradeStatus?.release_repo || "Simooonn/chatgpt2api";
+    return `https://github.com/${repo}/releases`;
+  },
   get hasUpdate() {
-    const [latest, current] = [this.latest, this.version].map((value) => value.split(".").map(Number));
-    const index = latest.findIndex((value, position) => value !== current[position]);
-    return Boolean(this.latest) && index >= 0 && latest[index] > current[index];
+    return Boolean(this.latest && this.version) && compareVersions(this.latest, this.version) > 0;
+  },
+  get upgradeBusy() {
+    return Boolean(this.trackingOpId || this.upgradeStatus?.in_progress || this.submittingUpgrade);
+  },
+  get isUpgradeTarget() {
+    return Boolean(this.selectedTag && this.version) && compareVersions(this.selectedTag, this.version) > 0;
+  },
+  get canTriggerUpgrade() {
+    return Boolean(
+      this.admin &&
+      this.upgradeStatus?.agent_online &&
+      !this.upgradeBusy &&
+      this.selectedTag &&
+      this.selectedTag.replace(/^v/, "") !== this.version,
+    );
+  },
+  phaseLabel(phase) {
+    return UPGRADE_PHASE_LABELS[phase] || phase || "";
+  },
+  stopUpgradePolling() {
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
+  },
+  startUpgradePolling() {
+    if (this.pollTimer) return;
+    this.pollTimer = setInterval(() => void this.pollUpgradeStatus(), 2000);
+  },
+  async pollUpgradeStatus() {
+    try {
+      const status = await api("/api/system/upgrade/status");
+      this.reconnecting = false;
+      this.upgradeStatus = status;
+      if (status.current_version) this.version = status.current_version;
+      const op = status.operation;
+      const finished = Boolean(op && (op.phase === "succeeded" || op.phase === "failed"));
+      if (this.trackingOpId && op?.id === this.trackingOpId && finished) {
+        this.trackingOpId = "";
+        this.stopUpgradePolling();
+        if (op.phase === "succeeded") {
+          toast(`已切换到 ${op.tag}`, "success");
+          fetch("/version").then((r) => r.json()).then((d) => { if (d.version) this.version = d.version; }).catch(() => {});
+          void this.refreshReleases(true);
+        } else {
+          toast(op.message || "升级失败", "error");
+        }
+      } else if (!this.trackingOpId && !status.in_progress) {
+        this.stopUpgradePolling();
+      }
+    } catch {
+      if (this.trackingOpId || this.upgradeStatus?.in_progress) {
+        this.reconnecting = true;
+      }
+    }
+  },
+  async refreshReleases(force = false) {
+    if (!this.admin) return;
+    this.refreshingReleases = true;
+    try {
+      const [relData, status] = await Promise.all([
+        api(`/api/system/releases${force ? "?force=1" : ""}`),
+        api("/api/system/upgrade/status"),
+      ]);
+      this.forkReleases = relData.releases || [];
+      this.upgradeStatus = status;
+      if (this.forkReleases.length > 0) {
+        this.latest = this.forkReleases[0].version;
+        if (!this.selectedTag || !this.forkReleases.some((item) => item.tag === this.selectedTag)) {
+          this.selectedTag = this.forkReleases[0].tag;
+        }
+      }
+      if (status.in_progress) this.startUpgradePolling();
+    } catch (error) {
+      if (force) toast(error.message || "获取版本信息失败", "error");
+    } finally {
+      this.refreshingReleases = false;
+    }
+  },
+  async triggerUpgrade() {
+    const tag = this.selectedTag;
+    if (!tag || !this.canTriggerUpgrade) return;
+    const ok = await confirmDialog({
+      title: `确认切换到 ${tag}？`,
+      text: `当前版本 v${this.version}，即将切换到 ${tag}。切换前会自动在线备份 SQLite 数据库，容器重启期间会短暂中断数秒；健康检查失败会自动回滚。`,
+      ok: "确认执行",
+      danger: false,
+    });
+    if (!ok) return;
+    this.submittingUpgrade = true;
+    try {
+      const op = await api("/api/system/upgrade", { method: "POST", body: { tag } });
+      this.trackingOpId = op.id;
+      this.upgradeStatus = { ...(this.upgradeStatus || {}), in_progress: true, operation: op };
+      this.startUpgradePolling();
+    } catch (error) {
+      toast(error.message || "提交升级请求失败", "error");
+    } finally {
+      this.submittingUpgrade = false;
+    }
   },
   async openReleases() {
     this.releasesOpen = true;
     this.checking = true;
-    const base = "https://raw.githubusercontent.com/basketikun/chatgpt2api/main";
-    const [version, changelog] = await Promise.all([fetch(`${base}/VERSION`).then((r) => r.text()), fetch(`${base}/CHANGELOG.md`).then((r) => r.text())]).finally(() => this.checking = false);
-    this.latest = version.split("\n")[0];
-    this.releases = parseChangelog(changelog);
+    try {
+      if (this.admin) {
+        await this.refreshReleases(false);
+      }
+      if (this.forkReleases.length === 0) {
+        const base = "https://raw.githubusercontent.com/basketikun/chatgpt2api/main";
+        const [version, changelog] = await Promise.all([fetch(`${base}/VERSION`).then((r) => r.text()), fetch(`${base}/CHANGELOG.md`).then((r) => r.text())]);
+        this.latest = version.split("\n")[0];
+        this.releases = parseChangelog(changelog);
+      }
+    } finally {
+      this.checking = false;
+    }
+  },
+  closeReleases() {
+    this.releasesOpen = false;
+    if (!this.trackingOpId) this.stopUpgradePolling();
   },
   logout() {
+    this.stopUpgradePolling();
     session.clear();
     this.session = null;
     navigate("/login");
@@ -2065,6 +2235,10 @@ addEventListener("popstate", () => location.pathname !== Alpine.store("app").pat
 
 window.Alpine = Alpine;
 Alpine.start();
-fetch("/version").then((response) => response.json()).then((data) => Alpine.store("app").version = data.version);
+fetch("/version").then((response) => response.json()).then((data) => {
+  const app = Alpine.store("app");
+  app.version = data.version;
+  if (app.admin) void app.refreshReleases(false);
+});
 navigate(location.pathname, true);
 

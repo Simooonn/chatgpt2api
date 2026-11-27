@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -40,7 +41,12 @@ func main() {
 	authService := service.NewAuthService(repo, cfg.APIKey)
 	taskService := service.NewTaskService(repo, aiService, cfg)
 	authHandler := handler.NewAuthHandler(authService, cfg.Version)
-	systemHandler := handler.NewSystemHandler(cfg, proxyService)
+	upgradeService := service.NewUpgradeService(service.UpgradeConfig{
+		ControlDir:     os.Getenv("CHATGPT2API_UPGRADE_CONTROL_DIR"),
+		ReleaseRepo:    os.Getenv("CHATGPT2API_RELEASE_REPO"),
+		CurrentVersion: cfg.Version,
+	}, nil)
+	systemHandler := handler.NewSystemHandler(cfg, proxyService).WithUpgrade(upgradeService)
 	engine := gin.New()
 	engine.Use(gin.Recovery(), handler.CORS, handler.LimitBody(cfg))
 	authHandler.RegisterLogin(engine)
